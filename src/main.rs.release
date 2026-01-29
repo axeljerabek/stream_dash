@@ -1,0 +1,278 @@
+use crossterm::{
+    cursor::{self, MoveTo},
+    event::{self, Event, KeyCode, KeyEventKind},
+    execute,
+    style::{Color, ResetColor, SetForegroundColor, Print},
+    terminal::{self, Clear, ClearType},
+};
+use regex::Regex;
+use std::collections::HashMap;
+use std::fs;
+use std::io::{self, Write};
+use std::process::Command;
+use std::time::{Duration, Instant};
+
+// --- STRUKTUREN ---
+struct AppState {
+    version: String,
+    interval_ms: u64,
+    color_mode: u8,
+    log_lines: u32,
+    peak_temp: f64,
+    peak_cpu: u64,
+    prev_idle: u64,
+    prev_total: u64,
+    prev_net_tx: u64,
+    prev_net_errs: u64,
+}
+
+struct Theme {
+    main: Color,
+    accent: Color,
+    info: Color,
+    dim: Color,
+    good: Color,
+    warn: Color,
+    bad: Color,
+    blue: Color,
+}
+
+fn get_theme(mode: u8) -> Theme {
+    match mode {
+        2 => Theme { main: Color::Green, accent: Color::Green, info: Color::Green, dim: Color::DarkGreen, good: Color::Green, warn: Color::Yellow, bad: Color::Red, blue: Color::Green },
+        3 => Theme { main: Color::White, accent: Color::Blue, info: Color::Cyan, dim: Color::DarkGrey, good: Color::Cyan, warn: Color::Yellow, bad: Color::Red, blue: Color::Blue },
+        _ => Theme { main: Color::White, accent: Color::Cyan, info: Color::Yellow, dim: Color::Grey, good: Color::Green, warn: Color::Yellow, bad: Color::Red, blue: Color::Blue },
+    }
+}
+
+// --- HELFER ---
+fn run_cmd(cmd: &str, args: &[&str]) -> String {
+    let output = Command::new(cmd).args(args).output();
+    match output {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        Err(_) => String::new(),
+    }
+}
+
+fn draw_bar(stdout: &mut io::Stdout, theme: &Theme, x: u16, y: u16, label: &str, val: u64, max: u64, unit: &str, extra: &str) -> io::Result<()> {
+    let width = 20;
+    let safe_max = max.max(1);
+    let percent = (val * 100 / safe_max).min(100);
+    let filled = (percent * width / 100) as u16;
+    let color = if percent > 85 { theme.bad } else if percent > 65 { theme.warn } else { theme.good };
+
+    execute!(stdout, MoveTo(x, y), SetForegroundColor(theme.main), Print(format!("{:<12} [", label)))?;
+    execute!(stdout, SetForegroundColor(color))?;
+    for _ in 0..filled { execute!(stdout, Print("#"))?; }
+    execute!(stdout, SetForegroundColor(theme.dim))?;
+    for _ in 0..(width as u16 - filled) { execute!(stdout, Print("-"))?; }
+    execute!(stdout, SetForegroundColor(theme.main), Print(format!("] {:>3}{}  {}", val, unit, extra)), Clear(ClearType::UntilNewLine))?;
+    Ok(())
+}
+
+fn draw_triple_bar(stdout: &mut io::Stdout, theme: &Theme, x: u16, y: u16, label: &str, v1: u64, v2: u64, tot: u64, suffix: &str) -> io::Result<()> {
+    let width = 20;
+    let safe_tot = tot.max(1);
+    let f1 = (v1 * width / safe_tot).min(width);
+    let f2 = (v2.saturating_sub(v1) * width / safe_tot).min(width - f1);
+
+    execute!(stdout, MoveTo(x, y), SetForegroundColor(theme.main), Print(format!("{:<12} [", label)))?;
+    execute!(stdout, SetForegroundColor(theme.good))?;
+    for _ in 0..f1 { execute!(stdout, Print("#"))?; }
+    execute!(stdout, SetForegroundColor(theme.blue))?;
+    for _ in 0..f2 { execute!(stdout, Print(":"))?; }
+    execute!(stdout, SetForegroundColor(theme.dim))?;
+    for _ in 0..(width - f1 - f2) { execute!(stdout, Print("-"))?; }
+    execute!(stdout, SetForegroundColor(theme.main), Print(format!("] {}/{}/{} MB {}", v1, v2, tot, suffix)), Clear(ClearType::UntilNewLine))?;
+    Ok(())
+}
+
+fn main() -> io::Result<()> {
+    let mut stdout = io::stdout();
+    terminal::enable_raw_mode()?;
+    execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide, Clear(ClearType::All))?;
+
+    let mut state = AppState {
+        version: "15.0-rs".to_string(),
+        interval_ms: 1000,
+        color_mode: 1,
+        log_lines: 10,
+        peak_temp: 0.0,
+        peak_cpu: 0,
+        prev_idle: 0,
+        prev_total: 0,
+        prev_net_tx: 0,
+        prev_net_errs: 0,
+    };
+
+    let re_ws = Regex::new(r"\s+").unwrap();
+
+    loop {
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let theme = get_theme(state.color_mode);
+        let mid_x = (cols / 2).max(50);
+
+        // --- CPU ---
+        let stat_s = fs::read_to_string("/proc/stat").unwrap_or_default();
+        let cpu_line = stat_s.lines().next().unwrap_or("");
+        let cpu_p: Vec<&str> = re_ws.split(cpu_line.trim()).collect();
+        let mut cpu_usage = 0;
+        if cpu_p.len() > 4 {
+            let total: u64 = cpu_p[1..8].iter().map(|s| s.parse().unwrap_or(0)).sum();
+            let idle: u64 = cpu_p[4].parse().unwrap_or(0);
+            let d_tot = total.saturating_sub(state.prev_total);
+            let d_idl = idle.saturating_sub(state.prev_idle);
+            if d_tot > 0 { cpu_usage = 100 * (d_tot - d_idl) / d_tot; }
+            state.prev_total = total; state.prev_idle = idle;
+            if cpu_usage > state.peak_cpu { state.peak_cpu = cpu_usage; }
+        }
+
+        // --- Temp ---
+        let temp_f: f64 = run_cmd("vcgencmd", &["measure_temp"]).replace("temp=", "").replace("'C", "").parse().unwrap_or(0.0);
+        if temp_f > state.peak_temp { state.peak_temp = temp_f; }
+
+        // --- Mem ---
+        let mem_s = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        let mut m = HashMap::new();
+        for l in mem_s.lines() {
+            let p: Vec<&str> = l.split_whitespace().collect();
+            if p.len() >= 2 { m.insert(p[0].replace(":", ""), p[1].parse::<u64>().unwrap_or(0)); }
+        }
+        let m_tot = *m.get("MemTotal").unwrap_or(&1);
+        let ram_app = m_tot.saturating_sub(*m.get("MemFree").unwrap_or(&0)).saturating_sub(*m.get("Buffers").unwrap_or(&0)).saturating_sub(*m.get("Cached").unwrap_or(&0));
+        let ram_res = ram_app + *m.get("Buffers").unwrap_or(&0) + *m.get("Cached").unwrap_or(&0);
+        
+        let cma_tot_kb = *m.get("CmaTotal").unwrap_or(&1);
+        let cma_free_kb = *m.get("CmaFree").unwrap_or(&0);
+
+        // --- DMA (BASH PARITY) ---
+        let dma_out = run_cmd("sudo", &["cat", "/sys/kernel/debug/dma_buf/bufinfo"]);
+        let mut dma_cats: HashMap<String, (u64, u64)> = HashMap::new();
+        let mut dma_total_active = 0u64;
+        for l in dma_out.lines() {
+            let p: Vec<&str> = l.split_whitespace().collect();
+            if l.contains("Total") && p.len() >= 4 { dma_total_active = p[3].parse().unwrap_or(0); }
+            if p.len() >= 6 && !l.starts_with("size") && !l.contains("Total") {
+                if let Ok(sz) = u64::from_str_radix(p[0], 16) {
+                    let n = if l.contains("vc_sm") { "GPU Shared" } 
+                            else if l.contains("rpicam") || l.contains("camera") || l.contains("pcie") { "Camera App" } 
+                            else if l.contains("drm") { "Kernel Bridge" } 
+                            else if l.contains("ls_grid") { "Lens Grid" } 
+                            else { "Sys/ISP" };
+                    let e = dma_cats.entry(n.to_string()).or_insert((0, 0)); e.0 += sz; e.1 += 1;
+                }
+            }
+        }
+
+        // --- Net ---
+        let net_s = fs::read_to_string("/proc/net/dev").unwrap_or_default();
+        let mut tx_bytes = 0u64; let mut total_errs = 0u64;
+        if let Some(l) = net_s.lines().find(|l| l.contains("eth0") || l.contains("wlan0")) {
+            let p: Vec<&str> = l.split_whitespace().collect();
+            if p.len() > 10 {
+                tx_bytes = p[9].parse().unwrap_or(0);
+                total_errs = p[2].parse::<u64>().unwrap_or(0) + p[3].parse::<u64>().unwrap_or(0);
+            }
+        }
+        let net_speed = (tx_bytes.saturating_sub(state.prev_net_tx)) * 8 / 1024 * 1000 / state.interval_ms;
+        let net_err_diff = total_errs.saturating_sub(state.prev_net_errs);
+        state.prev_net_tx = tx_bytes; state.prev_net_errs = total_errs;
+
+        // --- Disk ---
+        let df_out = run_cmd("df", &["/", "--output=pcent,avail"]);
+        let disk_p: Vec<&str> = df_out.lines().nth(1).unwrap_or("0% 0").split_whitespace().collect();
+        let disk_perc = disk_p.first().unwrap_or(&"0%").replace("%", "").parse::<u64>().unwrap_or(0);
+        let disk_free = disk_p.get(1).unwrap_or(&"0").parse::<f64>().unwrap_or(0.0) / 1024.0 / 1024.0;
+
+        // --- DRAWING ---
+        execute!(stdout, MoveTo(0, 0))?;
+        execute!(stdout, SetForegroundColor(theme.accent), Print("=== PI DASHBOARD === "), ResetColor, Print(format!("{} ", chrono::Local::now().format("%H:%M:%S"))), SetForegroundColor(theme.info), Print(format!("(v{})\n", state.version)))?;
+        execute!(stdout, MoveTo(0, 1), SetForegroundColor(theme.main), Print(format!("Uptime: {:<20} | Load: {}", run_cmd("uptime", &["-p"]).replace("up ", ""), fs::read_to_string("/proc/loadavg").unwrap_or_default().split_whitespace().take(3).collect::<Vec<_>>().join(" "))), Clear(ClearType::UntilNewLine))?;
+        execute!(stdout, MoveTo(0, 2), Print("-".repeat(cols as usize)))?;
+
+        draw_bar(&mut stdout, &theme, 0, 3, "CPU Usage:", cpu_usage, 100, "%", &format!("(Peak: {}%)", state.peak_cpu))?;
+        draw_bar(&mut stdout, &theme, 0, 4, "Temp:", temp_f as u64, 80, "°C", &format!("(Peak: {}°C)", state.peak_temp as u64))?;
+        draw_triple_bar(&mut stdout, &theme, 0, 5, "RAM Usage:", ram_app/1024, ram_res/1024, m_tot/1024, "(App/Cach/Tot)")?;
+        draw_triple_bar(&mut stdout, &theme, 0, 6, "CMA Map:", dma_total_active/1024/1024, (cma_tot_kb - cma_free_kb)/1024, cma_tot_kb/1024, "(Act/Res/Tot)")?;
+        draw_bar(&mut stdout, &theme, 0, 7, "Disk Usage:", disk_perc, 100, "%", &format!("({:.1} GB free)", disk_free))?;
+
+        execute!(stdout, MoveTo(mid_x, 3), SetForegroundColor(theme.info), Print("[DMA-BUFFER DETAILS]"), ResetColor)?;
+        execute!(stdout, MoveTo(mid_x, 4), SetForegroundColor(theme.dim), Print("Component          | Memory      | Count"), ResetColor)?;
+        execute!(stdout, MoveTo(mid_x, 5), SetForegroundColor(theme.dim), Print("-".repeat((cols - mid_x) as usize)), ResetColor)?;
+        let mut dma_v: Vec<_> = dma_cats.iter().collect();
+        dma_v.sort_by(|a, b| b.1.0.cmp(&a.1.0));
+        for (i, (n, (sz, ct))) in dma_v.iter().take(4).enumerate() {
+            execute!(stdout, MoveTo(mid_x, 6 + i as u16), Print(format!("{:<18} | {:>8.2} MB | {:>2}", n, *sz as f64 / 1024.0 / 1024.0, ct)), Clear(ClearType::UntilNewLine))?;
+        }
+
+        execute!(stdout, MoveTo(0, 9), SetForegroundColor(theme.info), Print("[HARDWARE & HEALTH]"), ResetColor)?;
+        let volt = run_cmd("vcgencmd", &["measure_volts", "core"]).replace("volt=", "");
+        let h264 = run_cmd("vcgencmd", &["measure_clock", "h264"]).split('=').last().unwrap_or("0").parse::<u64>().unwrap_or(0) / 1000000;
+        execute!(stdout, MoveTo(0, 10), Print(format!("Volt: {:<8} | H264 Clock: {:>3}MHz | Softirqs: {}", volt, h264, fs::read_to_string("/proc/stat").unwrap_or_default().lines().find(|l| l.contains("softirq")).unwrap_or("0 0").split_whitespace().nth(1).unwrap_or("0"))), Clear(ClearType::UntilNewLine))?;
+        execute!(stdout, MoveTo(0, 11), Print(format!("Net Errs/s: {:<3} | Throttled: ", net_err_diff)))?;
+        let thr = run_cmd("vcgencmd", &["get_throttled"]).replace("throttled=", "");
+        if thr == "0x0" { execute!(stdout, SetForegroundColor(theme.good), Print("None"))?; } else { execute!(stdout, SetForegroundColor(theme.bad), Print(&thr))?; }
+        execute!(stdout, Clear(ClearType::UntilNewLine))?;
+
+        execute!(stdout, MoveTo(0, 13), Print("-".repeat(cols as usize)))?;
+        let stream_p = run_cmd("ps", &["aux"]).lines().find(|l| l.contains("rpicam-vid") || l.contains("ffmpeg")).map(|l| {
+            let p: Vec<&str> = l.split_whitespace().collect();
+            format!("{} (CPU: {}%)", p.get(10).unwrap_or(&"unk"), p.get(2).unwrap_or(&"0"))
+        }).unwrap_or_else(|| "OFF".to_string());
+        execute!(stdout, MoveTo(0, 14), SetForegroundColor(theme.info), Print("Net: "), SetForegroundColor(theme.good), Print(format!("{:>6} kbps", net_speed)), SetForegroundColor(theme.info), Print(" Out | Stream: "), SetForegroundColor(if stream_p == "OFF" { theme.bad } else { theme.main }), Print(stream_p), Clear(ClearType::UntilNewLine))?;
+        execute!(stdout, MoveTo(0, 15), Print("-".repeat(cols as usize)))?;
+
+        let log_y = 17;
+        execute!(stdout, MoveTo(0, log_y), SetForegroundColor(theme.info), Print(format!("[SYSTEMD LOG: stream.service ({} lines)]", state.log_lines)), Clear(ClearType::UntilNewLine))?;
+        let logs = run_cmd("journalctl", &["-u", "stream.service", "-n", &state.log_lines.to_string(), "--no-pager"]);
+        for (i, l) in logs.lines().enumerate() {
+            if i as u32 >= state.log_lines { break; }
+            let clean_log = if l.len() > 7 { &l[7..] } else { l };
+            execute!(stdout, MoveTo(0, log_y + 1 + i as u16), ResetColor, Print(if clean_log.len() > cols as usize { &clean_log[..cols as usize] } else { clean_log }), Clear(ClearType::UntilNewLine))?;
+        }
+        
+        let footer_line_y = (log_y + 1 + state.log_lines as u16).min(rows - 2);
+        execute!(stdout, MoveTo(0, footer_line_y), Print("-".repeat(cols as usize)), Clear(ClearType::UntilNewLine))?;
+
+        let speed_display = if state.interval_ms < 1000 { format!("{}ms", state.interval_ms) } else { format!("{}s", state.interval_ms / 1000) };
+        execute!(stdout, MoveTo(0, rows - 1), SetForegroundColor(theme.dim), Print(format!("Controls: [+/-] Speed ({}) | [c] Color | [,/.] Logs ({}) | [q] Exit", speed_display, state.log_lines)), Clear(ClearType::UntilNewLine))?;
+        stdout.flush()?;
+
+        // --- EVENTS ---
+        if event::poll(Duration::from_millis(state.interval_ms))? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == KeyEventKind::Press {
+                    match key.code {
+                        KeyCode::Char('q') => break,
+                        KeyCode::Char('c') => { state.color_mode = if state.color_mode >= 3 { 1 } else { state.color_mode + 1 }; execute!(stdout, Clear(ClearType::All))?; }
+                        KeyCode::Char('+') => {
+                            state.interval_ms = match state.interval_ms {
+                                m if m > 1000 => m - 1000,
+                                1000 => 500,
+                                500 => 200,
+                                200 => 100,
+                                _ => 100,
+                            };
+                        }
+                        KeyCode::Char('-') => {
+                            state.interval_ms = match state.interval_ms {
+                                100 => 200,
+                                200 => 500,
+                                500 => 1000,
+                                m if m < 60000 => m + 1000,
+                                _ => 60000,
+                            };
+                        }
+                        KeyCode::Char('.') => { state.log_lines += 1; execute!(stdout, Clear(ClearType::All))?; },
+                        KeyCode::Char(',') => if state.log_lines > 1 { state.log_lines -= 1; execute!(stdout, Clear(ClearType::All))?; },
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
+    execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen)?;
+    terminal::disable_raw_mode()?;
+    Ok(())
+}
