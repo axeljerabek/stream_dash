@@ -52,11 +52,12 @@ fn draw_stacked_graph(stdout: &mut io::Stdout, x: u16, y: u16, history: &VecDequ
 }
 
 fn draw_simple_graph(stdout: &mut io::Stdout, x: u16, y: u16, history: &VecDeque<u64>, max_val: u64, color: Color) -> io::Result<()> {
+    let max_v = max_val.max(1);
     for row in 0..HIST_H {
         execute!(stdout, MoveTo(x, y + row as u16), SetForegroundColor(color))?;
         for &val in history {
-            let threshold = ((HIST_H - row) as u64 * max_val) / HIST_H as u64;
-            if val >= threshold { execute!(stdout, Print("█"))?; }
+            let threshold = ((HIST_H - row) as u64 * max_v) / HIST_H as u64;
+            if val > 0 && val >= threshold { execute!(stdout, Print("█"))?; }
             else { execute!(stdout, Print(" "))?; }
         }
     }
@@ -80,37 +81,40 @@ fn main() -> io::Result<()> {
     let re_ws = Regex::new(r"\s+").unwrap();
 
     loop {
-        // --- THEME ENGINE ---
         let (c_main, c_sec, c_cpu, c_temp, c_ram1, c_ram2, c_cma1, c_cma2) = match state.color_mode {
-            1 => (Color::Magenta, Color::Cyan, Color::Cyan, Color::Magenta, Color::Blue, Color::Cyan, Color::Red, Color::Yellow), // Cyberpunk
-            2 => (Color::Green, Color::DarkGreen, Color::Green, Color::Yellow, Color::Green, Color::DarkGreen, Color::DarkGreen, Color::Green), // Matrix/Classic
-            _ => (Color::Cyan, Color::Yellow, Color::Green, Color::Red, Color::Blue, Color::Cyan, Color::Magenta, Color::DarkMagenta), // Modern Default
+            1 => (Color::Magenta, Color::Cyan, Color::Cyan, Color::Magenta, Color::Blue, Color::Cyan, Color::Red, Color::Yellow),
+            2 => (Color::Green, Color::DarkGreen, Color::Green, Color::Yellow, Color::Green, Color::DarkGreen, Color::DarkGreen, Color::Green),
+            _ => (Color::Cyan, Color::Yellow, Color::Green, Color::Red, Color::Blue, Color::Cyan, Color::Magenta, Color::DarkMagenta),
         };
 
         let (cols, rows) = terminal::size().unwrap_or((120, 30));
         let mid_x = (cols / 2).max(55);
 
-        // --- DATA COLLECTION (Same as before) ---
+        // --- CPU DATA ---
         let stat_s = fs::read_to_string("/proc/stat").unwrap_or_default();
-        let load_s = fs::read_to_string("/proc/loadavg").unwrap_or_default();
         let cpu_line = stat_s.lines().next().unwrap_or("");
         let cpu_p: Vec<&str> = re_ws.split(cpu_line.trim()).collect();
-        let mut cpu_usage = 0;
+        let mut cur_cpu_usage = 0;
         if cpu_p.len() > 4 {
             let total: u64 = cpu_p[1..8].iter().map(|s| s.parse().unwrap_or(0)).sum();
             let idle: u64 = cpu_p[4].parse().unwrap_or(0);
             let d_tot = total.saturating_sub(state.prev_total);
             let d_idl = idle.saturating_sub(state.prev_idle);
-            if d_tot > 0 { cpu_usage = 100 * (d_tot - d_idl) / d_tot; }
-            state.prev_total = total; state.prev_idle = idle;
-            if cpu_usage > state.peak_cpu { state.peak_cpu = cpu_usage; }
+            if d_tot > 0 {
+                cur_cpu_usage = (100 * (d_tot - d_idl) / d_tot).min(100);
+                state.prev_total = total; state.prev_idle = idle;
+                state.cpu_history.push_back(cur_cpu_usage);
+                state.cpu_history.pop_front();
+                if cur_cpu_usage > state.peak_cpu { state.peak_cpu = cur_cpu_usage; }
+            }
         }
-        state.cpu_history.push_back(cpu_usage); state.cpu_history.pop_front();
 
+        // --- TEMP DATA ---
         let temp_f: f64 = run_cmd("vcgencmd", &["measure_temp"]).replace("temp=", "").replace("'C", "").parse().unwrap_or(0.0);
         if temp_f > state.peak_temp { state.peak_temp = temp_f; }
         state.temp_history.push_back(temp_f as u64); state.temp_history.pop_front();
 
+        // --- RAM DATA ---
         let mem_s = fs::read_to_string("/proc/meminfo").unwrap_or_default();
         let mut m = HashMap::new();
         for l in mem_s.lines() {
@@ -123,6 +127,7 @@ fn main() -> io::Result<()> {
         state.ram_history.push_back(MemPoint { val1: ram_app, val2: ram_app + m_cach, total: m_tot });
         state.ram_history.pop_front();
 
+        // --- CMA & DMA DATA ---
         let cma_tot = *m.get("CmaTotal").unwrap_or(&1);
         let cma_res = cma_tot.saturating_sub(*m.get("CmaFree").unwrap_or(&0));
         let dma_out = run_cmd("sudo", &["cat", "/sys/kernel/debug/dma_buf/bufinfo"]);
@@ -141,6 +146,7 @@ fn main() -> io::Result<()> {
         state.cma_history.push_back(MemPoint { val1: dma_active/1024, val2: cma_res, total: cma_tot });
         state.cma_history.pop_front();
 
+        // --- NET DATA ---
         let net_s = fs::read_to_string("/proc/net/dev").unwrap_or_default();
         let mut tx_bytes = 0u64; let mut net_errs = 0u64;
         if let Some(l) = net_s.lines().find(|l| l.contains("wlan0") || l.contains("eth0")) {
@@ -154,15 +160,15 @@ fn main() -> io::Result<()> {
         let err_diff = net_errs.saturating_sub(state.prev_net_errs);
         state.prev_net_tx = tx_bytes; state.prev_net_errs = net_errs;
 
-        // --- DRAWING ---
+        // --- DRAW ---
         execute!(stdout, MoveTo(0, 0), SetForegroundColor(c_main), Print(format!("=== PI DASHBOARD === {} (v{})", chrono::Local::now().format("%H:%M:%S"), state.version)))?;
-        execute!(stdout, MoveTo(0, 1), SetForegroundColor(Color::White), Print(format!("Uptime: {} | Load: {}", run_cmd("uptime", &["-p"]).replace("up ", ""), load_s.trim())))?;
+        execute!(stdout, MoveTo(0, 1), SetForegroundColor(Color::White), Print(format!("Uptime: {} | Load: {}", run_cmd("uptime", &["-p"]).replace("up ", ""), fs::read_to_string("/proc/loadavg").unwrap_or_default().trim())))?;
         execute!(stdout, MoveTo(0, 2), SetForegroundColor(Color::DarkGrey), Print("-".repeat(cols as usize)))?;
 
         execute!(stdout, MoveTo(0, 3), SetForegroundColor(c_sec), Print("CPU HISTORY"), MoveTo(mid_x, 3), Print("TEMP HISTORY"))?;
         draw_simple_graph(&mut stdout, 0, 4, &state.cpu_history, 100, c_cpu)?;
         draw_simple_graph(&mut stdout, mid_x, 4, &state.temp_history, 80, c_temp)?;
-        execute!(stdout, MoveTo(0, 8), ResetColor, Print(format!("Usage: {}% (Peak: {}%)", cpu_usage, state.peak_cpu)), MoveTo(mid_x, 8), Print(format!("Temp: {:.1}°C (Peak: {}°C)", temp_f, state.peak_temp)))?;
+        execute!(stdout, MoveTo(0, 8), ResetColor, Print(format!("Usage: {}% (Peak: {}%)", cur_cpu_usage, state.peak_cpu)), MoveTo(mid_x, 8), Print(format!("Temp: {:.1}°C (Peak: {}°C)", temp_f, state.peak_temp)))?;
 
         execute!(stdout, MoveTo(0, 10), SetForegroundColor(c_sec), Print("RAM (App/Cache/Tot)"), MoveTo(mid_x, 10), Print("CMA (Act/Res/Tot)"))?;
         draw_stacked_graph(&mut stdout, 0, 11, &state.ram_history, c_ram1, c_ram2)?;
@@ -194,8 +200,7 @@ fn main() -> io::Result<()> {
             execute!(stdout, MoveTo(0, log_y + 1 + i as u16), ResetColor, Print(if l.len() > cols as usize { &l[l.len()-cols as usize..] } else { l }), Clear(ClearType::UntilNewLine))?;
         }
 
-        let speed_label = if state.interval_ms < 1000 { format!("{}ms", state.interval_ms) } else { format!("{}s", state.interval_ms/1000) };
-        execute!(stdout, MoveTo(0, rows-1), SetForegroundColor(Color::DarkGrey), Print(format!("Controls: [+/-] Speed ({}) | [c] Color | [,/.] Logs ({}) | [q] Exit", speed_label, state.log_lines)), Clear(ClearType::UntilNewLine))?;
+        execute!(stdout, MoveTo(0, rows-1), SetForegroundColor(Color::DarkGrey), Print(format!("Controls: [+/-] Speed ({}ms) | [c] Color | [,/.] Logs ({}) | [q] Exit", state.interval_ms, state.log_lines)), Clear(ClearType::UntilNewLine))?;
 
         stdout.flush()?;
         if event::poll(Duration::from_millis(state.interval_ms))? {
