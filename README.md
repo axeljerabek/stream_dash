@@ -1,4 +1,7 @@
 🍓 stream_dash (v23.0-rs)
+
+![Dashboard Demo](screenshots/stream_dash.png)
+
 The evolution of [stream_top](https://github.com/axeljerabek/stream_top). A high-performance, Rust-based diagnostic dashboard for Raspberry Pi power users. While the original Bash version focused on raw numbers, stream_dash introduces Real-Time History Graphs to visualize hardware trends over time.
 
 🔍 Why stream_dash?
