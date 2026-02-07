@@ -31,14 +31,19 @@ We use a unique layered visualization to show memory health at a glance:
 1. Requirements
 Ensure you have the Rust toolchain installed:
 
-Bash
+
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
 2. Build & Run
-Bash
+
 git clone https://github.com/axeljerabek/stream_dash.git
+
 cd stream_dash
+
 cargo build --release
+
 sudo ./target/release/stream_dash
+
 Note: sudo is required to read the kernel's DMA debug interface.
 
 🎮 Interactive Controls
