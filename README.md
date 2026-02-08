@@ -46,7 +46,7 @@ cargo build --release
 
 sudo ./target/release/stream_dash
 
-(Or make it system wide: "cp ./target/release/stream_dash /usr/local/bin/"
+(Or install with: "install -s target/release/stream_dash /usr/local/bin/"
 
 Note: sudo is required to read the kernel's DMA debug interface.
 
