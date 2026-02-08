@@ -42,6 +42,8 @@ cd stream_dash
 
 cargo build --release
 
+(On a Rpi Zero or Zero2W or other low-RAM machines try: cargo build --release -j 1 )
+
 sudo ./target/release/stream_dash
 
 Note: sudo is required to read the kernel's DMA debug interface.
